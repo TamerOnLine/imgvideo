@@ -5,6 +5,7 @@ __pycache__/
 .env.*
 PROJECT_LOG.jsonl
 AGENTS.md
+*.zip
 *.mkv
 *.mp4
 *.mov

@@ -1,11 +1,19 @@
 import argparse, fcntl, hashlib, json, os, secrets, shutil, subprocess, threading, time, uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 ROOT=Path(__file__).resolve().parent
 STATE=ROOT/'state'; STATE.mkdir(exist_ok=True)
 TOKEN=secrets.token_urlsafe(32)
-STATUS={'running':False,'items':[]}
+def restored_status(directory):
+ try:
+  saved=json.loads((directory/'last-batch.json').read_text())
+  if not isinstance(saved,dict) or not isinstance(saved.get('items'),list):raise ValueError('Invalid batch state')
+  if saved.get('running'):
+   saved.update(running=False,interrupted=True,error='انقطع التشغيل قبل تأكيد اكتمال الدفعة؛ استأنف صراحة للتحقق من الملفات المكتملة ومتابعة البقية')
+  return saved
+ except (OSError,ValueError):return {'running':False,'items':[]}
+STATUS=restored_status(STATE)
 LOCK=threading.Lock()
 EXT={'.mp4','.mkv','.mov','.avi','.webm','.m4v','.ts','.mts'}
 
@@ -124,7 +132,19 @@ class Handler(BaseHTTPRequestHandler):
    if (self.headers.get('Host') or '').split(':')[0] not in ('localhost','127.0.0.1'):return self.reply(403,{'error':'Local host required'})
    u=urlparse(self.path)
    if u.path=='/':return self.reply(200,(ROOT/'index.html').read_text().replace('__TOKEN__',TOKEN),'text/html; charset=utf-8')
-   if u.path=='/api/status':return self.reply(200,STATUS)
+   if u.path=='/api/download':
+    value=parse_qs(u.query).get('output',[''])[0]
+    item=next((x for x in STATUS['items'] if x.get('output')==value and x.get('verified') and x.get('state') in ('complete','resumed')),None)
+    if not item:return self.reply(404,{'error':'No verified output found'})
+    path=Path(value).resolve(strict=True)
+    if not path.is_file():return self.reply(404,{'error':'Output unavailable'})
+    with path.open('rb') as f:
+     self.send_response(200);self.send_header('Content-Type','video/x-matroska');self.send_header('Content-Length',str(os.fstat(f.fileno()).st_size));self.send_header('Content-Disposition',"attachment; filename=video-silent.mkv; filename*=UTF-8''"+quote(path.name));self.send_header('Cache-Control','no-store');self.send_header('X-Content-Type-Options','nosniff');self.end_headers();shutil.copyfileobj(f,self.wfile)
+    return
+   if u.path=='/api/workflow':
+    p=STATE/'workflow.json'
+    return self.reply(200,json.loads(p.read_text()) if p.exists() else {})
+   if u.path=='/api/status':return self.reply(200,{**STATUS,'can_resume':(STATE/'batch-request.json').is_file() and not STATUS.get('running')})
    if u.path=='/api/tools':
     try:return self.reply(200,{'ok':True,**tools(settings())})
     except Exception as e:return self.reply(200,{'ok':False,'error':str(e)})
@@ -150,12 +170,27 @@ class Handler(BaseHTTPRequestHandler):
     return self.reply(200,choose())
    if self.path=='/api/settings':
     checked=tools(d);atomic(STATE/'tools.json',{k:checked[k] for k in ('ffmpeg','ffprobe')});return self.reply(200,{'ok':True})
-   if self.path=='/api/start':
-    tools(settings())
-    files,output=prepare_batch(d.get('files'),d.get('output'),d.get('create_output') is True)
+   if self.path=='/api/workflow':
+    value={}
+    for key in ('directory','output'):
+     v=d.get(key,'')
+     if not isinstance(v,str):raise ValueError('مسار غير صالح')
+     value[key]=str(local_path(v,False)) if v.strip() else ''
+    value['create_output']=d.get('create_output') is True
+    atomic(STATE/'workflow.json',value)
+    return self.reply(200,{'ok':True,**value})
+   if self.path in ('/api/start','/api/resume'):
     with LOCK:
-     if STATUS['running']:raise ValueError('دفعة قيد العمل بالفعل')
-     STATUS={'running':True,'items':[],'total':len(files),'position':0}
+     if STATUS.get('running'):raise ValueError('دفعة قيد العمل بالفعل')
+     if self.path=='/api/resume':
+      if not (STATE/'batch-request.json').is_file():raise ValueError('لا طلب دفعة محفوظ للاستئناف؛ اعرض الملفات وحددها')
+      d=json.loads((STATE/'batch-request.json').read_text())
+      d['create_output']=False
+     tools(settings())
+     files,output=prepare_batch(d.get('files'),d.get('output'),d.get('create_output') is True)
+     atomic(STATE/'batch-request.json',{'files':files,'output':output})
+     STATUS={'running':True,'items':[],'total':len(files),'position':0,'interrupted':False}
+     atomic(STATE/'last-batch.json',STATUS)
      threading.Thread(target=batch,args=(files,output),daemon=True).start()
     return self.reply(202,{'ok':True})
    return self.reply(404,{'error':'Not found'})
