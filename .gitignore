@@ -1,0 +1,12 @@
+state/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+PROJECT_LOG.jsonl
+AGENTS.md
+*.mkv
+*.mp4
+*.mov
+*.avi
+*.webm
